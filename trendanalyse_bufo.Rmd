@@ -1,0 +1,1161 @@
+---
+title: "trendanalyse_bufo"
+author: "Ellen Blomme"
+date: "9-3-2023"
+output: html_document
+---
+
+The data cleaning and first exploration of the data was done by Hans Matheve.
+
+# IMPORT AND CLEAN THE DATA
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(mgcv)
+library(stats)
+library(boot)
+library(MASS)
+library(gratia)
+library(stageR)
+
+library(janitor)
+library(viridis)
+library(hrbrthemes)
+library(sf)
+library(broom)
+```
+
+```{r import data}
+amfib <- read_delim("PaddenoverzetDag_2023_01_25 12_26_50.csv", delim = ";") %>% 
+  clean_names() %>%
+  mutate(line = row_number()) %>%
+  filter(jaar != 2023)
+
+categorie <- read_csv("categorie.csv") %>% 
+  dplyr::select(-c(n))
+```
+
+```{r data cleaning}
+sites <- amfib %>% 
+  distinct(gemeente, naam) %>%
+  mutate(site_code = paste0(naam, ", ", gemeente))
+
+amfib <- amfib %>% 
+  mutate(naam = toupper(gsub("[*]","", naam))) %>%
+  mutate(datum = gsub("1/01/1970", NA, datum)) %>%
+  mutate_if(is.logical, as.numeric)
+
+sites <- amfib %>% 
+  distinct(provincie, gemeente, naam) %>%
+  mutate(gemeente = gsub("MEEUWEN-GRUITRODE", "MEEUWEN", gemeente)) %>%
+  mutate(gemeente = gsub("GLABBEEK-ZUURBEMDE", "GLABBEEK", gemeente)) %>%
+  mutate(site_code = paste0(naam, ", ", gemeente)) %>%
+  arrange(site_code) %>%
+  mutate(site_id = row_number()) %>%
+  dplyr::select(site_id, site_code, naam, gemeente, provincie)
+
+amfib <- amfib %>% 
+  mutate(site_code = paste0(naam, ", ", gemeente)) %>%
+  left_join(dplyr::select(sites, site_id, site_code), by="site_code")
+
+amfib <- amfib %>% 
+  mutate(jaar = as.numeric(jaar)) %>%
+  mutate(datum = as.Date(datum, "%d/%m/%Y"))
+
+amfib_long <- amfib %>%
+  dplyr::select(site_id, jaar, datum:salamanders_kolken) %>%
+  pivot_longer(!c(site_id:temperatuur), names_to = "categorie", values_to = "count")
+
+amfib_long <- amfib_long %>% left_join(categorie, by="categorie")
+```
+
+```{r summary data}
+site_jaar_overview_dagen <- amfib_long %>% 
+  filter(!is.na(datum) & !is.na(jaar) & !is.na(site_id)) %>%
+  distinct(site_id, jaar, datum) %>%
+  group_by(site_id, jaar) %>%
+  dplyr::summarise(tot_jaar_dagen = n())
+
+sites_summary <- sites %>%
+  left_join(site_jaar_overview_dagen %>%
+              group_by(site_id) %>% 
+              dplyr::summarise(jaren_alle = n()), by="site_id") %>%
+  left_join(site_jaar_overview_dagen %>%
+              filter(jaar > 2010) %>%
+              group_by(site_id) %>% 
+              dplyr::summarise(jaren_2011 = n()), by="site_id")
+
+sites_summary <- sites %>%
+  left_join(site_jaar_overview_dagen %>%
+              group_by(site_id) %>% 
+              dplyr::summarise(jaren_alle = n()), by="site_id") %>%
+  left_join(site_jaar_overview_dagen %>%
+              filter(jaar > 2010) %>%
+              group_by(site_id) %>% 
+              dplyr::summarise(jaren_2011 = n()), by="site_id")
+```
+
+# DATA EXPLORATIE
+
+```{r poster afb1}
+actieve_sites_jaar <- amfib_long %>%
+  filter(jaar > 2010 & jaar < 2023) %>%
+  distinct(jaar, site_id) %>%
+  group_by(jaar) %>% 
+  tally()
+
+amfib_long %>% 
+  filter(jaar > 2010 & jaar < 2023) %>%
+  left_join(actieve_sites_jaar, by="jaar") %>%
+  left_join(sites, by="site_id") %>%
+  filter(soort == "PAD" & !is.na(provincie)) %>%
+  filter(!is.na(count)) %>%
+  group_by(jaar, provincie) %>%
+  dplyr::summarise(aantal_site = log(sum(count)/n())) %>% 
+  ggplot(aes(x=jaar, y=aantal_site, group=provincie, color=provincie)) +
+  geom_line(size=.5, alpha=.666, show.legend = T) +
+  geom_smooth(method = "lm", fill = NA) +
+  scale_color_viridis(discrete = TRUE) +
+  ggtitle("COMMON TOAD | log(count/countdays) per year 2011-2022") + 
+  xlab("Year") +
+  ylab("log(count/countdays)")+
+  scale_x_continuous(breaks = scales::pretty_breaks()) +
+  theme_ipsum()
+```
+
+# TOAD ANALYSIS
+This thesis is only about the toad data. So before proceeding, we only select
+this data whereby the count of toad is not null. We only select the sites with 
+more than 5 years on countdata. 
+
+```{r subset the data}
+# select counts of toad that are not missing
+bufo_bufo <- amfib_long[amfib_long$soort == "PAD" & 
+                          !is.na(amfib_long$count), ]
+
+# join site info with count data
+bufo_bufo <- merge(x = bufo_bufo, y = sites, 
+                   by = "site_id", all.x = TRUE)
+
+# clean variables and make a column with the total count and count days per year
+bufo <- bufo_bufo %>%
+  dplyr::rename(year = jaar) %>%
+  group_by(year, site_id) %>%
+  dplyr::summarise(count = sum(count),
+                   countdays = n())
+
+# remove sites with < 5 years of counts
+bufo <- filter(bufo, site_id %in% 
+                 sites_summary$site_id[sites_summary$jaren_alle > 5])
+sites_summary <- filter(sites_summary, site_id %in% 
+                          sites_summary$site_id[sites_summary$jaren_alle > 5])
+
+# Remove rows with NA's in sites or years
+bufo <- na.omit(bufo)
+```
+
+A short exploration of the amount of sites that will be analysed and the average
+amount of counting years we have over all the years
+
+```{r short summary, include=FALSE}
+print(paste(dplyr::n_distinct(bufo$site_id), 
+            'sites with more than 5 years of counts'))
+
+print(paste(mean(sites_summary$jaren_alle), 
+            ', is the average amount of years that is counted per site'))
+print(paste('The mean amount of days that is counted per year:',
+            mean(bufo$countdays)))
+
+print(paste(dplyr::n_distinct(sites_summary$site_id
+                              [sites_summary$jaren_alle > 9]), 
+            'sites with 10 years or more years of counts'))
+```
+
+The countdays (= days of counting per year) is not constant. Therefore we will 
+use a rate model.
+
+Is there evidence for a site effect? We compare two models where the residuals are modeled as i.i.d. normal variables while rm models the residuals as having mean dependent on the site random variable.
+
+```{r site as factor}
+rm <- lme(count ~ 1, bufo, random = ~ 1 | factor(site_id))
+rm0 <- lm(count ~ 1, bufo)
+anova(rm,rm0)
+
+bufo$site_id <- factor(bufo$site_id)
+```
+The generalized likelihood ratio test (GLRT) test rejects the H0 hypothesis, 
+so there is evidence that there is a site effect. The AIC also show a real site 
+effect.
+
+Before proceeding with further analysis we add NA values for the years there 
+were no counts, so we end up that each site has a continuous range of years.
+```{r add NA for discontinuous ranges}
+unique_cats <- unique(bufo$site_id)
+new_bufo <- data.frame(site_id = factor(),
+                       year = numeric(),
+                       count = numeric(),
+                       countdays = numeric())
+
+
+# Loop through each category in the dataset
+for (cat in unique_cats) {
+  
+  # Subset the dataset by category
+  subset_data <- bufo[bufo$site_id == cat,]
+  
+  # Define a sequence of years spanning the range of the data for this category
+  seq_years <- seq(min(subset_data$year), max(subset_data$year), by = 1)
+  
+  # Loop through each year in the sequence
+  for (yr in seq_years) {
+    
+    # Check if the year is in the subset data
+    if (yr %in% subset_data$year) {
+      # If so, add the existing data to the adjusted data
+      new_bufo <- rbind(new_bufo, subset_data[subset_data$year == yr,])
+    } else {
+      # If not, add the category, year, and NA count to the adjusted data
+      new_bufo <- rbind(new_bufo, data.frame(site_id = cat, 
+                                             year = yr, 
+                                             count = NA, 
+                                             countdays = NA))
+    }
+  }
+}
+```
+
+
+## Time-series correlation structure
+We work with a time-series. This means that there might be temporal correlation 
+or autocorrelation (the count of last year is correlated with this year). Before 
+a model can be specified, a correlation structure should be defined. 
+
+First we select some sites with the highest amount of count years. It is best
+to define the correlation structure on the sites with longest time series. 
+However in this dissertation we focus on sites that can be modelled with
+different models
+```{r subset the sites with most years}
+# Top N highest values by group
+top_5 <- sites_summary %>%                      
+  arrange(desc(jaren_alle)) %>%
+  dplyr::slice(1:5)
+
+# make a subset of the sites with the most years of countdata
+site_top <- new_bufo %>%
+  filter(site_id %in% top_5$site_id)
+
+sites <- site_top$site_id
+
+# six sites who can be divided in three classes of modelling
+sites <- c(200, 319, 334, 403, 518, 585)
+```
+- gam: 585, 319
+- gam (edf = 1): 403, 518
+- glm: 200, 334
+
+A quick look at the distribution of the data.
+```{r count in a hist}
+# count per day
+hist_Data <- new_bufo %>% 
+  drop_na(count) %>%
+  filter(site_id %in% sites)
+ggplot(hist_Data, aes(x=count)) +
+  geom_histogram() + 
+  facet_grid(site_id ~ .)
+
+# log(count)/log(countdays)
+ggplot(site_top, aes(x=count)) +
+  geom_histogram() + 
+  facet_grid(site_id ~ .)
+```
+
+First we want to define the distribution of the data.
+```{r overdispersion}
+M1 <- glm(count ~ year + offset(log(countdays)), family = poisson, 
+          data = new_bufo[new_bufo$site_id == sites[1], ])
+anova(M1)
+phi = 7821.3/24
+```
+There is evidence of overdispersion.
+
+An ACF (autocorrelation function) plot is used to the define the correlation 
+structure. This relies on the assumption of normality. Therefore The residuals 
+of a glm will be used. We look at the residual plots and use the goodness of 
+fit test to define the right distribution (poisson, quasipoisson or negative 
+binomial) in the model.
+```{r correlation structure per site}
+# plot the all the acf plots at once for each site
+  par(mfrow = c(3, 1)) 
+for (index in 1:6) {
+  # split the data per site id
+  data <- new_bufo[new_bufo$site_id == sites[index], ]
+  
+  # make a gam to get a sense of the correlation in the data
+  # make different models to see if the correlation comes from year
+  #model <- glm(count ~ year + offset(log(countdays)), family = poisson, 
+  #             data = data)
+  #model1 <- glm(count ~ offset(log(countdays)), family = poisson, data = data)
+  
+  # look at different distributions
+  #Qmodel <- glm(count ~ year + offset(log(countdays)), family = quasipoisson, 
+  #              data = data)
+  #NBmodel <- glm.nb(count ~ year + offset(log(countdays)), data = data)
+  #NBmodel1 <- glm.nb(count ~ offset(log(countdays)), data = data)
+  
+  GAM_modelP <- gam(count ~ s(year) + offset(log(countdays)),
+                     data = data,
+                     family = poisson)
+  GAM_modelQP <- gam(count ~ s(year) + offset(log(countdays)),
+                     data = data,
+                     family = quasipoisson)
+  GAM_modelNB <- gam(count ~ s(year) + offset(log(countdays)),
+                     data = data,
+                     family = nb())
+  GAM_modelNB1 <- gam(count ~ offset(log(countdays)),
+                     data = data,
+                     family = nb())
+  
+  # plot the acf plot on the residuals of the model (acf relies on normal dist)
+  # plot the acf plot also on the model without the year variable
+  print(acf(resid(GAM_modelNB1, type = "pearson")))
+  print(acf(resid(GAM_modelNB, type = "pearson"), 
+      main = paste("ACF plot for site", sites[index])))
+  print(pacf(resid(GAM_modelNB, type = "pearson"), 
+       main = paste("PACF plot for site", sites[index])))
+  
+  #print(summary(NBmodel))
+  
+  # the goodness of fit test is sign => reject H0, try a new distribution
+  # H0: the model is a good fit
+  print(pchisq(deviance(GAM_modelP), df.residual(GAM_modelP), lower=FALSE))
+  print(pchisq(deviance(GAM_modelQP), df.residual(GAM_modelQP),lower = FALSE))
+  print(pchisq(deviance(GAM_modelNB), df.residual(GAM_modelNB),lower = FALSE))
+  
+  # look at the assumptions
+  #glm.diag.plots(NBmodel)
+}
+```
+
+The goodness of fit test shows that negative binomial distribution is the 
+better distribution for our data. Further, we can assume that there is an AR1
+correlation structure in the model as the pattern of the acf plot is not 
+visible anymore in the pacf plot.
+
+
+
+
+# SITES WITH MOST YEARS
+A plot is made to see the trend per site.
+
+```{r explore plot}
+for (index in 1:6) {
+  # split the data per site id
+  data <- new_bufo[new_bufo$site_id == sites[index], ]
+  data <- drop_na(data)
+  
+  # make a gam model
+  model <- gam(count ~ s(year) + offset(log(countdays)),
+               data = data,
+               family = nb())
+  
+  # get the simultaneous confidence interval
+  ci <- confint(model, type = "simultaneous", parm = "s(year)")
+  
+  # make a plot for each site id
+  print(ggplot(data = ci, aes(x = year, 
+                              y = est + model$coefficients[1])) +
+          labs(title = paste('trend of site', sites[index]),
+               x = "year",
+               y = "log(count/countdays)") +
+          geom_line(colour = "aquamarine3", size = 1) +
+          geom_ribbon(alpha = .3, 
+                      aes(ymin = lower + model$coefficients[1], 
+                          ymax = upper + model$coefficients[1])) +
+          geom_point(data = data, aes(x = year, y = log(count/countdays))) +
+          stat_smooth(method = "lm",
+                      formula = y ~ x,
+                      geom = "smooth", se = F, colour = "lightsalmon"))
+}
+
+```
+
+
+## model these sites (with most years)
+We want to compare the linear model (gam without splines) for these sites with
+the additive models (gam). We make models with and without correlation.
+
+```{r define data}
+# we plot these models per site, so first we make a subset of the data
+index <- 1
+site_data <- new_bufo[new_bufo$site_id == sites[index], ]
+```
+
+We fit the linear model
+```{r linear model (gam no splines)}
+sites[index]
+# Fit a GAM with temporal correlation and the negative binomial distribution
+# without splines.
+cor_lin_fit <- gam(count ~ year + offset(log(countdays)),
+                     correlation = corAR1(form = ~ year),
+                     family = nb(), 
+                     data = site_data)
+
+lin_fit <- gam(count ~ year + offset(log(countdays)),
+                 family = nb(), 
+                 data = site_data)
+
+summary(cor_lin_fit)
+summary(lin_fit)
+```
+
+We fit a more flexible GAM model.
+```{r additive model (gam) with splines}
+sites[index]
+# Fit a GAM with temporal correlation and the negative binomial distribution
+cor_spline <- gam(count ~ s(year) + offset(log(countdays)), 
+                       family = nb(), 
+                       correlation = corAR1(form = ~ year),
+                       data = site_data)
+spline <- gam(count ~ s(year) + offset(log(countdays)),
+              family = nb(),
+              data = site_data)
+
+# Summarize the model
+summary(cor_spline)
+coef(cor_spline)
+
+summary(spline)
+coef(spline)
+
+# visualize the model
+plot(cor_spline, shade = T, residuals = T)
+plot(spline, shade = T, residuals = T)
+```
+
+We compare both fits. We also evaluate if there is still temporal correlation
+present in the data when we model it as a GAM.
+```{r compare models}
+sites[index]
+
+# What is the best model? additive or linear
+anova(cor_lin_fit, cor_spline, test = "Chisq")
+
+# is there a serial correlation in the data
+anova(cor_spline)
+anova(spline)
+acf(resid(spline))
+
+# are there enough basis functions in the gam
+gam.check(cor_spline)
+```
+
+```{r visualize all the acf plots}
+for (index in 1:6) {
+    # we plot these models per site, so first we make a subset of the data
+  site_data <- new_bufo[new_bufo$site_id == sites[index], ]
+  
+  spline <- gam(count ~ s(year) + offset(log(countdays)),
+              family = nb(),
+              data = site_data)
+  
+  acf(resid(spline), main = c("ACF plot for site", sites[index]))
+  
+  pacf(resid(spline), main = c("PACF plot for site", sites[index]))
+}
+```
+There is no proof that when we use the residuals of the GAM, there is still
+temporal correlation. The structure is captured by the more flexible fit of
+the model.
+
+
+## is the serial correlation detectable in the model?
+
+```{r simulate time series count data}
+# Set seed for reproducibility
+set.seed(123)
+
+# Define parameters
+n <- 100   # Sample size
+mu <- 5   # Mean
+theta <- 3  # Dispersion parameter
+phi <- 0.4  # AR(1) coefficient
+
+# Simulate AR(1) negative binomial time series
+eps <- rnbinom(n, mu = mu, size = theta)  # Simulate independent noise
+y <- numeric(n)  # Initialize the time series
+y[1] <- eps[1]  # Set the initial value to the first noise observation
+
+for (i in 2:n) {
+  y[i] <- phi * y[i-1] + eps[i]  # Generate the time series using AR(1) process
+}
+
+# View the first 10 observations
+head(y, 10)
+```
+
+```{r fit the sim to the model}
+# make the GAM
+model <- gam(y ~ s(time(y)),
+                family = nb())
+
+# plot the residuals of the model in the acf plot
+acf(resid(model), 
+    main = paste("acf plot simulation"))
+
+# visualize the plot
+AIC(model)
+```
+This is evidence that temporal correlation is still visible when we simulate 
+data with an AR1 structure. However we cannot use the gam function to
+incorporate this temporal correlation structure into the model.
+
+
+# TREND ANALYSIS
+We want to see the trend per site. Therefore, we did model selection. However, 
+when the GAM model is the best model and we model it as GLM, the temporal
+correlation is not captured correctly. In those cases we can take inference of
+contrast between the begin and end point of the flexible model.
+
+We start by selecting 6 sites: 2 sites with GLM as best fit, 2 sites with GAM
+as best fit and 2 sites with GAM as best fit but with edf = 1.
+
+- gam: 585, 319
+- gam (edf = 1): 403, 518
+- glm: 200, 334
+```{r select the sites}
+sites <- c(200, 319, 334, 403, 518, 585)
+```
+
+
+we start by exploring these sites.
+```{r plot the centered GAM for each site}
+for (site in sites) {
+  # select the data per site
+  site_data <- new_bufo[new_bufo$site_id == site, ]
+  
+  # make the models
+  gam_model <- gam(count ~ s(year) + offset(log(countdays)),
+                   data = site_data,
+                   family = nb())
+  
+  # get the simultaneous confidence interval
+  gam_ci <- confint(gam_model, type = "simultaneous", parm = "s(year)")
+  
+  # also get the linear fit around 0 to compare both fits
+  # Calculate the mean of the predictor variable
+  mean_predictor <- mean(log(site_data$count/site_data$countdays), na.rm = TRUE)
+  
+  # Center the predictor variable around zero
+  data_centered <- mutate(site_data,
+                          center = log(count/countdays) - mean_predictor)
+  # visualise everything in a plot:
+  # show observations with the GAM and GLM fit.
+  # plot the GAM with its simulataneous CI
+  print(ggplot() +
+          geom_line(data = gam_ci, aes(x = year, y = est), 
+                    colour = "aquamarine3", size = 1) +
+          geom_ribbon(data = gam_ci, alpha = .3, aes(x = year, 
+                                                     y = est, 
+                                                     ymin = lower, 
+                                                     ymax = upper)) +
+          stat_smooth(data = data_centered, aes(x = year, 
+                                                y = center),
+                      method = "lm",
+                      formula = y ~ x,
+                      geom = "smooth",
+                      se = F, 
+                      colour = "lightsalmon") + 
+          ggtitle(paste("baseline plot of site", site)) + 
+          ylab("log(count/countdays)"))
+}
+```
+
+```{r plot the trend for each of the selected sites}
+for (site in sites) {
+  # split the data per site id
+  data <- new_bufo[new_bufo$site_id == site, ]
+  data <- drop_na(data)
+  
+  # make a gam model
+  model <- gam(count ~ s(year) + offset(log(countdays)),
+               data = data,
+               family = nb())
+  
+  # get the simultaneous confidence interval
+  ci <- confint(model, type = "simultaneous", parm = "s(year)")
+  
+  # make a plot for each site id
+  print(ggplot(data = ci, aes(x = year, 
+                              y = est + model$coefficients[1])) +
+          labs(title = paste('trend of site', site),
+               x = "year",
+               y = "log(count/countdays)") +
+          geom_line(colour = "aquamarine3", size = 1) +
+          geom_ribbon(alpha = .3, 
+                      aes(ymin = lower + model$coefficients[1], 
+                          ymax = upper + model$coefficients[1])) +
+          geom_point(data = data, aes(x = year, y = log(count/countdays))) +
+          stat_smooth(method = "lm",
+                      formula = y ~ x,
+                      geom = "smooth", se = F, colour = "lightsalmon"))
+}
+```
+
+Is there a trend visible, in other words in the model significantly different 
+from 0. So when the 0-line is not within the confidence interval of the model
+(grey zone), than we can conclude there is a trend.
+
+
+# OMNIBUS TESTING
+```{r look site per site}
+site <- sites[1]
+site_data <- new_bufo[new_bufo$site_id == site, ]
+```
+
+Now we test the first contrast.
+```{r gam model and no relation model}
+# make the gam per site
+gam_mod <- gam(count ~ s(year) + offset(log(countdays)),
+               data = site_data,
+               family = nb())
+# split linear and smoother term, now we are able to test the non-linearity
+null_mod <- gam(count ~ offset(log(countdays)),
+               data = site_data,
+               family = nb())
+```
+
+```{r is there a trend}
+# look at the p-value of the model
+anova(null_mod, gam_mod, test = "Chisq")
+```
+If the p-value > 0.05 we cannot reject H0 (H0: there is no trend in the site).
+Only when the p-value < 0.05 there is a trend at the site.
+
+Is the trend linear or should it be modelled in a more flexible way.
+```{r linear or gam}
+glm_mod <- gam(count ~ year + offset(log(countdays)),
+               data = site_data,
+               family = nb())
+
+anova(glm_mod, gam_mod, test = "Chisq")
+```
+
+# FIRST CONTRAST: BEGIN - END
+
+```{r other imput}
+# when necessary rerun this chunk to find the statistical inference for a different site
+site <- sites[1]
+site_data <- new_bufo[new_bufo$site_id == site, ]
+
+# make the gam per site
+gam_mod <- gam(count ~ s(year) + offset(log(countdays)),
+               data = site_data,
+               family = nb())
+```
+
+
+```{r contrast values}
+# Get the fitted values for the first and last observation
+# => not necessary for further analysis
+first_obs <- predict(gam_mod, newdata = site_data[1, ])
+last_obs <- predict(gam_mod, newdata = site_data[nrow(site_data), ])
+
+# look at the variance-covariance matrix
+variances <- vcov(gam_mod)
+
+# calculate the contrast matrix L
+first <- t(as.matrix(model.matrix(gam_mod, newdata = site_data[1, ])))
+last <- t(as.matrix(model.matrix(gam_mod, newdata = site_data[nrow(site_data), ])))
+L <- last - first
+
+var_estimate <- as.numeric(t(L) %*% variances %*% L)
+
+```
+
+```{r is this contrast sign}
+# Calculate standard error of the difference
+se_value <- sqrt(var_estimate)
+
+estimate <- t(L) %*% gam_mod$coefficients
+
+# effect size: how much different is the end-begin from 0
+t_stat <- (t(L) %*% gam_mod$coefficients - 0)/se_value
+
+# pnorm(q) returns the probability that a random variable following the standard 
+# normal distribution falls below q.
+pval <- (pnorm(abs(t_stat), lower.tail = FALSE)) * 2
+site; estimate; se_value; t_stat; pval
+```
+We perform the t-test by hand and estimate the p-values.
+
+
+# SECOND CONTRAST: MEAN SLOPE
+
+To evaluate the second contrast we use the same sites as in contrast 1. This
+method requires to get the first derivatives of the GAM smoothers and take the
+average to get the mean slope of the smoother. We start by selecting the data
+per site and fit the model.
+
+```{r select data}
+# when necessary rerun this chunk to find the statistical inference for a different site
+site <- sites[1]
+site_data <- new_bufo[new_bufo$site_id == site, ]
+
+# make the gam per site
+gam_mod <- gam(count ~ s(year) + offset(log(countdays)),
+               data = site_data,
+               family = nb())
+
+# the variance is previously calculated (the same as the first contrast)
+variances <- vcov(gam_mod)
+```
+
+Then we can calculate the first derivative for each year and get the mean slope.
+This method is based on the course of Lieven Clement and the code of the help
+file of predict.gam
+```{r first derivative}
+eps <- 1e-7 ## finite difference interval
+## where to evaluate derivatives
+x.mesh <- seq(min(site_data$year),max(site_data$year),length=nrow(site_data))
+
+# get the fitted values of the data which is slightly larger than the original
+x.mesh <- x.mesh + eps ## shift the evaluation mesh
+newd <- data.frame(year = x.mesh, 
+                   countdays = rep(mean(site_data$countdays, na.rm = T)))
+X1 <- predict(gam_mod, newd, type="lpmatrix")
+
+# get the fitted values of the data which is slightly smaller than the original
+x.mesh <- x.mesh - 2 * eps ## shift the evaluation mesh
+newd <- data.frame(year = x.mesh, 
+                   countdays = rep(mean(site_data$countdays, na.rm = T)))
+X_1 <- predict(gam_mod, newd, type="lpmatrix")
+
+## maps coefficients to (fd approx.) derivatives
+L <- (X1 - X_1) / (2 * eps)
+L <- colMeans(L, na.rm = TRUE)
+
+# the mean slope of the given site
+mean_slope <- L %*% coef(gam_mod)       ## ith smooth derivative
+```
+
+
+```{r is this slope sign}
+# here we get the variance estimate of the contrast matrix
+var_estimate <- as.numeric(t(L) %*% variances %*% L)
+
+# Calculate standard error of the mean
+se_value <- sqrt(var_estimate)
+
+# effect size: how much different is the average slope from 0
+t_stat <- (L %*% coef(gam_mod) - 0)/se_value
+
+# calculate the p-value
+pval <- (pnorm(abs(t_stat), lower.tail = FALSE)) * 2
+site; mean_slope; se_value; t_stat; pval
+```
+
+We can check the mean slope by using the derivatives function of the gratia
+package.
+```{r control with the derivatives function}
+# get the derivatives and the year values into a dataframe
+derivs <- data.frame(derivatives = derivatives(gam_mod, type = "central")$derivative,
+                     year = derivatives(gam_mod, type = "central")$data,
+                     se = derivatives(gam_mod, type = "central")$se)
+
+# extract the derivatives for the values that are closest to the round year
+derivs$year_round <- round(derivs$year)
+closest_derivs <- derivs %>%
+  group_by(year_round) %>%
+  dplyr::slice(which.min(abs(year_round - year))) %>%
+  ungroup()
+
+# get the mean slope
+avg_slope <- sum(closest_derivs$derivatives)/nrow(closest_derivs)
+avg_slope
+```
+
+We can visualize the derivatives of the smoothers using the derivatives function
+which also has an estimate for the simultaneous confidence interval.
+```{r plot the derivatives for the different sites}
+for (site in sites) {
+  # select the data per site
+  site_data <- new_bufo[new_bufo$site_id == site, ]
+  
+  # make a gam model
+  gam_model <- gam(count ~ s(year) + offset(log(countdays)),
+               data = site_data,
+               family = nb())
+  glm_model <- gam(count ~ year + offset(log(countdays)),
+                   data = site_data,
+                   family = nb())
+  
+  plot_data <- derivatives(gam_model, type = "central", interval = "simultaneous")
+  
+  print(ggplot() + 
+          geom_ribbon(data = plot_data, aes(x = data, y = derivative,
+                                    ymin = lower, 
+                                    ymax = upper),
+                      alpha = .3) +
+          geom_line(data = plot_data, aes(x = data, y = derivative),
+                    colour = "green3", size = 1)  +
+           geom_segment(aes(x = min(site_data$year),
+                        y = glm_model$coefficients[2],
+                        xend = max(site_data$year),
+                        yend = glm_model$coefficients[2]), 
+                        size = 1, colour = "sandybrown") +
+          xlab("year") +
+          ggtitle(paste("first derivative of site", site)))
+}
+```
+Each time the 0 is not included in the confidence interval, there is a clear
+increase or decrease in the model.
+
+
+# MULTIPLE TESTING PROBLEM
+We have to assess the trends for all the sites. If we assess the t-test for all
+these sites at significance level alpha (5%), we will report a vast amount of 
+false positives. For each site we have a 5% chance to report a false positive. 
+We can give an upperbound of how many false positives we expect to return: 
+235*0.05 = 12. So we need other methods to control the false positives.
+
+```{r set up empty data set}
+multiple_prob <- data.frame(
+                site_id = sites_summary$site_id[sites_summary$jaren_alle > 9],
+                omnibus_p_value = rep(NA, 111),
+                omni_adj_pval = rep(NA, 111),
+                C1_end_begin = rep(NA, 111),
+                C1_p_value = rep(NA, 111),
+                C1_adj_pval = rep(NA, 111),
+                C2_mean_slope = rep(NA, 111),
+                C2_p_value = rep(NA, 111), 
+                C2_adj_pval = rep(NA, 111))
+
+GAM_sites <- sites_summary$site_id[sites_summary$jaren_alle > 9]
+```
+We can only look at the GAM of the sites where the time series is long enough.
+
+We complete the dataset using the same protocol to estimate the different 
+contrasts for each site.
+```{r contrasts}
+eps <- 1e-7 ## finite difference interval
+for (site in GAM_sites) {
+  group_data <- new_bufo[new_bufo$site_id == site, ]
+  
+  # make the gam per site
+  GAM_mod <- gam(count ~ s(year) + offset(log(countdays)),
+                 data = group_data,
+                 family = nb())
+  # make the model with no relationship
+  null_mod <- gam(count ~ offset(log(countdays)),
+                 data = group_data,
+                 family = nb())
+  
+  # get the p-value of the omnibus test
+  multiple_prob$omnibus_p_value[multiple_prob$site_id == site] <- anova(null_mod, GAM_mod, test = "Chisq")$`Pr(>Chi)`[2]
+  
+  # when the p-value is missing use
+  dev_null <- deviance(null_mod)
+  dev_gam <- deviance(GAM_mod)
+  df <- null_mod$df.residual - GAM_mod$df.residual
+  lr_test <- abs(dev_null - dev_gam)
+  omni_p_value <- pchisq(lr_test, df, lower.tail = FALSE)
+  multiple_prob$omnibus_p_value <- ifelse(is.na(multiple_prob$omnibus_p_value),
+                                          omni_p_value,
+                                          multiple_prob$omnibus_p_value)
+  
+  # look at the variance-covariance matrix
+  variances <- vcov(GAM_mod)
+  
+  # first contrast: end - begin
+  # Get the fitted values for the first and last observation
+  first_obs <- predict(GAM_mod, newdata = group_data[1, ])
+  last_obs <- predict(GAM_mod, newdata = group_data[nrow(group_data), ])
+
+  # calculate the contrast matrix L
+  first <- t(as.matrix(model.matrix(GAM_mod, newdata = group_data[1, ])))
+  last <- t(as.matrix(model.matrix(GAM_mod, 
+                                   newdata = group_data[nrow(group_data), ])))
+  L_C1 <- last - first
+
+  var_estimate_C1 <- as.numeric(t(L_C1) %*% variances %*% L_C1)
+  
+  # Calculate standard error of the mean
+  se_value_C1 <- sqrt(var_estimate_C1)
+  
+  # effect size: how much different is the end-begin from 0
+  difference <- t(L_C1)%*%GAM_mod$coefficients
+  t_stat_c1 <- (difference - 0)/se_value_C1
+
+  # normal distribution falls below q.
+  p_value <- 2 * (1 - pnorm(abs(t_stat_c1)))
+  
+  multiple_prob$C1_end_begin[multiple_prob$site_id == site] <- difference
+  multiple_prob$C1_p_value[multiple_prob$site_id == site] <- p_value
+
+  # second contrast: average slope
+  # where to evaluate derivatives
+  x.mesh <- seq(min(group_data$year),max(group_data$year),length=nrow(group_data))
+
+  # get the fitted values of the data which is slightly larger than the original
+  x.mesh <- x.mesh + eps ## shift the evaluation mesh
+  newd <- data.frame(year = x.mesh, 
+                     countdays = rep(mean(group_data$countdays, na.rm = T)))
+  X1 <- predict(GAM_mod, newd, type="lpmatrix")
+
+  # get the fitted values of the data which is slightly smaller than the original
+  x.mesh <- x.mesh - 2 * eps ## shift the evaluation mesh
+  newd <- data.frame(year = x.mesh, 
+                     countdays = rep(mean(group_data$countdays, na.rm = T)))
+  X_1 <- predict(GAM_mod, newd, type="lpmatrix")
+
+  ## maps coefficients to (fd approx.) derivatives
+  L_C2 <- (X1 - X_1) / (2 * eps)
+  L_C2 <- colMeans(L_C2, na.rm = T)
+  
+  # the mean slope of the given site
+  avg_slope <- L_C2 %*% coef(GAM_mod)       
+  ## ith smooth derivative
+  
+  var_estimate_C2 <- as.numeric(t(L_C2) %*% variances %*% L_C2)
+  
+  # Calculate standard error of the mean
+  se_value_C2 <- sqrt(var_estimate_C2)
+  
+  # effect size: how much average slope different from 0
+  t_stat_C2 <- (L_C2 %*% coef(GAM_mod) - 0)/se_value_C2
+  
+  # calculate the p-value of one-side and multiply by 2
+  p_value_C2 <- (pnorm(abs(t_stat_C2), lower.tail = FALSE)) * 2
+
+  multiple_prob$C2_mean_slope[multiple_prob$site_id == site] <- avg_slope
+  multiple_prob$C2_p_value[multiple_prob$site_id == site] <- p_value_C2
+}
+```
+
+
+There are three sites, where the GAM is almost equal to the null fit. 
+Therefore the p-value is missing (overfitting). 
+We adjust these p-values by manually assessing the fit.
+This is the case for three sites: 156, 344, 414
+
+We explore the adjusted correction per column. We cannot do this in one loop as
+the dataframe is sorted in a different way for each column
+```{r perform FDR for each test}
+# adjusted p values for omnibus test
+multiple_prob$omni_adj_pval <- p.adjust(multiple_prob$omnibus_p_value, method = "fdr")
+
+# adjusted p values for C1
+multiple_prob$C1_adj_pval <- p.adjust(multiple_prob$C1_p_value, method = "fdr")
+
+# adjusted p values for C2
+multiple_prob$C2_adj_pval <- p.adjust(multiple_prob$C2_p_value, method = "fdr")
+```
+
+we perform different tests on the same sites, we don't want
+to have false positives for different sites. Therefore, we
+conduct the stagewise testing.
+```{r conduct the stage wise testing}
+# set the pvalues of the omnibus test to the pScreen variable:
+# is there a trend in the site
+pScreen <- multiple_prob[, 'omnibus_p_value']
+names(pScreen) <- multiple_prob[, 'site_id']
+# set the p-values of the contrast testing in the confirmation variable
+pConfirmation <- as.matrix(multiple_prob[, c('C1_p_value', 'C2_p_value')])
+rownames(pConfirmation) <- multiple_prob[, 'site_id']
+
+stageRObj <- stageR(pScreen=pScreen, pConfirmation=pConfirmation)
+stageRObj <- stageWiseAdjustment(object=stageRObj, method="holm", alpha=0.05)
+adj_val <- getAdjustedPValues(stageRObj, onlySignificantGenes=FALSE, order=FALSE)
+
+no_trend <- getAdjustedPValues(stageRObj, onlySignificantGenes=TRUE, order=FALSE)
+```
+
+
+```{r make a vulcano plot}
+res <- data.frame(site_id = multiple_prob[, 'site_id'],
+                  C1_adj_p = multiple_prob[, 'C1_adj_pval'],
+                  C1_effect = multiple_prob[, 'C1_end_begin'],
+                  C1_pval = multiple_prob[, 'C1_p_value'])
+
+volcanoT <- res %>% 
+  ggplot(aes(x = C1_effect, y = -log10(C1_pval), color = C1_adj_p < 0.05)) +
+    geom_point(cex = 2.5) +
+    scale_color_manual(values = alpha(c("black", "red"), 0.5)) +
+    theme_minimal()
+volcanoT
+```
+
+
+
+
+```{r get all the sites that rejected H0 in the omnibus}
+sign_trend <- getAdjustedPValues(stageRObj, onlySignificantGenes=TRUE, order=FALSE)
+
+no_trend <- GAM_sites[!(GAM_sites %in% dimnames(sign_trend)[[1]])]
+```
+
+Is the significance of the different contrasts the same: when the p-value
+for C1 is smaller than 0.05 is this also the case for C2?
+```{r control significance for separate contrasts}
+for (index in 1:nrow(sign_trend)) {
+    if (sign_trend[index, 2] > 0.05) {
+        if (sign_trend[index, 3] < 0.05){
+          print(paste(rownames(sign_trend)[index],
+                      sign_trend[index, ]))}
+    } else {
+        if (sign_trend[index, 3] > 0.05) {
+          print(paste(rownames(sign_trend)[index],
+                      sign_trend[index, ]))}
+    }
+}
+```
+
+
+## label the trends
+We base the labels on the begin-end contrast. Because when we consider the 
+mean slope, it might be that the decrease is fast in the beginning and
+afterwards it is constant. When we take the average of the slope this effect
+is a distorted picture because the large effect is averaged out.
+```{r label the sites}
+# make a new dataset to save the labelling per site
+label_sites <- data.frame(site_id = GAM_sites,
+                          label = rep(NA, 111))
+
+# select all the sites that have significant values for screening
+# and confirmation hypotheses (begin - end)
+all_sign <- multiple_prob[multiple_prob$site_id %in% dimnames(sign_trend[sign_trend[, 2] < 0.05, ])[[1]], ]
+# if the site is not in the list that have p-value < 0.05 for the omnibus test there is no trend
+label_sites$label <- ifelse(label_sites$site_id %in% dimnames(sign_trend)[[1]], 'trend', 'unsignificant')
+
+# if the screening hypothesis is not sign, the trend is flexible
+label_sites$label <- ifelse(label_sites$site_id %in% dimnames(sign_trend[sign_trend[, 2] > 0.05, ])[[1]], 'flexible', label_sites$label) 
+
+# if all tests are sign, the sites with negative estimates are decreasing, otherwise the population is increasing
+label_sites$label <- ifelse(label_sites$site_id %in% all_sign[all_sign$C1_end_begin > 0,]$site_id, 'increase', label_sites$label)
+label_sites$label <- ifelse(label_sites$site_id %in% all_sign[all_sign$C1_end_begin < 0,]$site_id, 'decrease', label_sites$label)
+```
+
+## visualize the flexible plots
+What is the trend in the plots when the trend is significant but when 
+the estimate of the trend (contrast) is not flexible.
+```{r select all the sites with label "flexible"}
+flex_site <- label_sites$site_id[label_sites$label == "flexible"]
+```
+
+```{r make plots of flexible sites}
+for (site in flex_site) {
+  # split the data per site id
+  data <- new_bufo[new_bufo$site_id == site, ]
+  data <- drop_na(data)
+  
+  # make a gam model
+  model <- gam(count ~ s(year) + offset(log(countdays)),
+               data = data,
+               family = nb())
+  
+  # get the simultaneous confidence interval
+  ci <- confint(model, type = "simultaneous", parm = "s(year)")
+  
+  # make a plot for each site id
+  print(ggplot(data = ci, aes(x = year, 
+                              y = est + model$coefficients[1])) +
+          labs(title = paste('flexible trend of site', site),
+               x = "year",
+               y = "log(count/countdays)") +
+          geom_line(colour = "aquamarine3", size = 1) +
+          geom_ribbon(alpha = .3, 
+                      aes(ymin = lower + model$coefficients[1], 
+                          ymax = upper + model$coefficients[1])) +
+          geom_point(data = data, aes(x = year, y = log(count/countdays))) +
+          stat_smooth(method = "lm",
+                      formula = y ~ x,
+                      geom = "smooth", se = F, colour = "lightsalmon"))
+}
+```
+
+
+# TREND IN SHORT TIME SERIES
+```{r get estimates and p-values for lm}
+# make a vector with all the sites with a short time series
+GLM_sites <- sites_summary$site_id[sites_summary$jaren_alle <= 9]
+# make an empty data frame
+GLM_trend <- data.frame(site_id = GLM_sites,
+                        omnibus = rep(NA, 124),
+                        beta_estimate = rep(NA, 124),
+                        p_val = rep(NA, 124),
+                        label = rep(NA, 124))
+
+for (site in GLM_sites) {
+  # select the data per site
+  site_data <- new_bufo[new_bufo$site_id == site, ]
+  
+  # make the model (glm and null) for each site
+  GLM_model <- glm.nb(count ~ year + offset(log(countdays)), 
+                      data = site_data)
+  null_model <- glm.nb(count ~ offset(log(countdays)), 
+                      data = site_data)
+  
+  # get the p-value of the omnibus test
+  GLM_trend$omnibus[GLM_trend$site_id == site] <- anova(null_model, GLM_model, test = "Chisq")$`Pr(Chi)`[2]
+  
+  # extract the estimate and the p-value
+  GLM_trend$beta_estimate[GLM_trend$site_id == site] <- summary(GLM_model)$coefficients[2,1] # slope of the lm
+  GLM_trend$p_val[GLM_trend$site_id == site] <- summary(GLM_model)$coefficients[2,4] # p-value for estimate
+}
+```
+
+```{r correction for multiple testing}
+GLM_trend$p_adj <- p.adjust(GLM_trend$p_val, method = "fdr")
+```
+
+```{r labeling of the trends}
+# if the p-value is smaller than the adj alpha than there is a trend
+# otherwise it is a weak conclusion, need equivalence to test if it is stable
+# if the estimate >0 than the there is a population increase
+# otherwise there is a decrease
+GLM_trend$label <- ifelse(GLM_trend$p_adj < 0.05,
+                            ifelse(GLM_trend$beta_estimate > 0,
+                                   'increase', 'decrease'),
+                            'unsignificant')
+```
+
+# MAKE EXCEL FILE
+```{r make a file for the GAM estimates}
+library(xlsx)
+# join the info about the sites with the estimates
+GAM_output <- sites_summary %>%
+  full_join(multiple_prob, by = "site_id") %>%
+  dplyr::select(-c(omnibus_p_value, omni_adj_pval, 
+                   C1_p_value, C1_adj_pval,
+            C2_mean_slope, C2_p_value, C2_adj_pval,
+            jaren_alle, jaren_2011))
+
+GAM_output <- merge(GAM_output, data.frame(sign_trend), by.x = "site_id", by.y =  "row.names")
+
+# join the labels and filter only the significant sites
+GAM_output <- GAM_output %>%
+  left_join(label_sites, by = "site_id") %>%
+  filter(label != 'unsignificant') %>%
+  dplyr::select(-c(padjScreen, C2_p_value)) %>%
+  dplyr::rename(adj_pval = C1_p_value)
+
+# Write the data to csv
+# write.csv(GAM_output, file = "GAM_output.csv", row.names = F)
+# Write the first data set in a new workbook
+#write.xlsx(GAM_output, file = "bufo_trend.xlsx", sheetName = "GAM estimates", append = FALSE)
+```
+
+```{r make a file for the GLM estimates}
+# join the info about the sites with the estimates
+# and filter only the significant sites
+GLM_output <- sites_summary %>%
+  full_join(GLM_trend, by = "site_id") %>%
+  dplyr::select(-c(omnibus, p_val,
+            jaren_alle, jaren_2011)) %>%
+  filter(label != 'unsignificant') %>%
+  relocate(label, .after = last_col())
+
+# Write the data to csv
+# write.csv(GLM_output, file = "GLM_output.csv", row.names = F)
+```
